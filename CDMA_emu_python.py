@@ -5,72 +5,72 @@ import queue
 import sys
 from collections import deque
 
-# ---------- Уолша-коды длины 8 (±1) ----------
+# --- Уолш-коды ---
 def hadamard(n: int) -> List[List[int]]:
     if n & (n - 1) != 0 or n == 0:
         raise ValueError("Длина должна быть степенью 2")
     H = [[1]]
     while len(H) < n:
-        top = [row + row for row in H]
-        bottom = [row + [-x for x in row] for row in H]
+        top = [r + r for r in H]
+        bottom = [r + [-x for x in r] for r in H]
         H = top + bottom
     return H
 
 def walsh_codes(L: int) -> List[List[int]]:
-    return hadamard(L)  # строки — ортогональные коды (±1)
+    return hadamard(L)
 
-# ---------- Битовки ASCII и биполярное представление ----------
+# --- Биты и преобразования ---
 def bits_from_ascii(text: str) -> List[int]:
-    data = text.encode('ascii', errors='strict')
+    data = text.encode('ascii')
     bits: List[int] = []
     for b in data:
-        for i in range(7, -1, -1):  # MSB -> LSB
+        for i in range(7, -1, -1):
             bits.append((b >> i) & 1)
     return bits
 
 def bipolar(bit: int) -> int:
-    return 1 if bit == 1 else -1
+    return 1 if bit else -1
 
-def bits_to_byte(msb_first_bits: List[int]) -> int:
-    val = 0
-    for b in msb_first_bits:
-        val = (val << 1) | (b & 1)
-    return val
+def bits_to_byte(bits: List[int]) -> int:
+    v = 0
+    for b in bits:
+        v = (v << 1) | (b & 1)
+    return v
 
-# ---------- Канал: суммирует чипы и публикует мягкие значения ----------
+# --- Канал ---
 class Channel:
-    def __init__(self, num_stations: int):
-        self.num_stations = num_stations
-        self.buf = [0] * num_stations  # текущие чипы от станций (±1)
-        self._subscriber: Optional["queue.SimpleQueue[int]"] = None
-        self._sub_lock = threading.Lock()
+    def __init__(self, n: int):
+        self.n = n
+        self.buf = [0] * n
+        self._sub: Optional["queue.SimpleQueue[int]"] = None
+        self._lock = threading.Lock()
 
         def aggregate():
-            total = sum(self.buf)  # мягкая сумма пользователей за чип
-            with self._sub_lock:
-                if self._subscriber is not None:
-                    self._subscriber.put(total)  # публикуем без печати
-            for i in range(self.num_stations):
+            total = sum(self.buf)
+            with self._lock:
+                if self._sub is not None:
+                    self._sub.put(total)
+            for i in range(self.n):
                 self.buf[i] = 0
 
-        self.barrier = threading.Barrier(num_stations, action=aggregate)
+        self.barrier = threading.Barrier(n, action=aggregate)
 
-    def send_chip(self, station_idx: int, value: int):
-        self.buf[station_idx] = value
+    def send(self, idx: int, val: int):
+        self.buf[idx] = val
         self.barrier.wait()
 
-    def attach_receiver(self, q: "queue.SimpleQueue[int]"):
-        with self._sub_lock:
-            self._subscriber = q
+    def attach(self, q: "queue.SimpleQueue[int]"):
+        with self._lock:
+            self._sub = q
 
-# ---------- Поток передатчика ----------
+# --- Передатчик ---
 class Transmitter(threading.Thread):
-    def __init__(self, name: str, message: str, code: List[int], station_idx: int, channel: Channel):
+    def __init__(self, name: str, msg: str, code: List[int], idx: int, ch: Channel):
         super().__init__(name=f"TX-{name}", daemon=True)
-        self.bits = bits_from_ascii(message)
+        self.bits = bits_from_ascii(msg)
         self.code = code
-        self.station_idx = station_idx
-        self.channel = channel
+        self.idx = idx
+        self.ch = ch
 
     def run(self):
         L = len(self.code)
@@ -78,188 +78,122 @@ class Transmitter(threading.Thread):
         while True:
             b = self.bits[i]
             i = (i + 1) % len(self.bits)
-            bpol = bipolar(b)  # 0->-1, 1->+1
+            bpol = bipolar(b)
             for k in range(L):
-                chip = bpol * self.code[k]  # spreading по Уолшу
-                self.channel.send_chip(self.station_idx, chip)
+                self.ch.send(self.idx, bpol * self.code[k])
 
-# ---------- Приёмник: чип-синхронизация + поиск байтового смещения ----------
+# --- Сырой вывод канала ---
+class BitTap(threading.Thread):
+    def __init__(self, ch: Channel, group: int = 64):
+        super().__init__(name="BIT-TAP", daemon=True)
+        self.ch = ch
+        self.group = group
+        self.q: "queue.SimpleQueue[int]" = queue.SimpleQueue()
+
+    def run(self):
+        self.ch.attach(self.q)
+        count = 0
+        while True:
+            total = self.q.get()
+            bit = 1 if total >= 0 else 0
+            print(bit, end='', flush=True)
+            count += 1
+            if count % self.group == 0:
+                print()
+
+# --- Приёмник ---
 class Receiver(threading.Thread):
-    def __init__(self, channel, codes, words, station: str):
+    def __init__(self, ch: Channel, codes: Dict[str, List[int]], words: Dict[str, str], st: str):
         super().__init__(name="RX", daemon=True)
-        self.channel = channel
-        self.codes = codes
-        self.words = words
-        self._station = station
-        self._code = codes[station]
-        self._expected = words[station].encode('ascii')
-        self._chip_queue: "queue.SimpleQueue[int]" = queue.SimpleQueue()
+        self.ch = ch
+        self.code = codes[st]
+        self.exp = words[st].encode('ascii')
+        self.q: "queue.SimpleQueue[int]" = queue.SimpleQueue()
         self._stop = threading.Event()
-        self._paused = threading.Event()      # флаг паузы
         self._synced = False
-        self._byte_shift = None
-        self._window = deque(maxlen=8)        # окно на 8 чипов
-        self._bits_stream = []                # восстановленные биты (MSB-first)
-
-    # БЫЛО ОТСУТСТВУЕТ — ДОБАВИТЬ:
-    def pause(self):
-        self._paused.set()  # приостановить чтение/демодуляцию
-
-    def resume(self):
-        self._paused.clear()  # продолжить
-
-    def _flush_queue(self):
-        try:
-            while True:
-                self._chip_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-    def _reset_state(self):
-        self._synced = False
-        self._byte_shift = None
-        self._window.clear()
-        self._bits_stream.clear()
-        self._flush_queue()
-
-    def set_station(self, station: str):
-        self._station = station
-        self._code = self.codes[station]
-        self._expected = self.words[station].encode('ascii')
-        self._reset_state()
+        self._shift: Optional[int] = None
+        self._win = deque(maxlen=8)
+        self._bits: List[int] = []
 
     def stop(self):
         self._stop.set()
 
     def run(self):
-        self.channel.attach_receiver(self._chip_queue)
+        self.ch.attach(self.q)
         L = 8
         while not self._stop.is_set():
-            if self._paused.is_set():         # уважать паузу
-                time.sleep(0.02)
-                continue
-
-            # 1) чиповая синхронизация
             if not self._synced:
-                while len(self._window) < L:
-                    self._window.append(self._chip_queue.get())
-                dot = sum(self._window[i] * self._code[i] for i in range(L))
-                if abs(dot) >= 7:             # порог
+                while len(self._win) < L:
+                    self._win.append(self.q.get())
+                dot = sum(self._win[i] * self.code[i] for i in range(L))
+                if abs(dot) >= 7:
                     self._synced = True
                 else:
-                    self._window.append(self._chip_queue.get())
+                    self._win.append(self.q.get())
                 continue
 
-            # 2) восстановление бита из 8 чипов
-            chips = list(self._window)
-            self._window.clear()
+            chips = list(self._win)
+            self._win.clear()
             for _ in range(L):
-                self._window.append(self._chip_queue.get())
-            bit = 1 if sum(chips[i]*self._code[i] for i in range(L)) >= 0 else 0
-            self._bits_stream.append(bit)
+                self._win.append(self.q.get())
+            bit = 1 if sum(chips[i] * self.code[i] for i in range(L)) >= 0 else 0
+            self._bits.append(bit)
 
-            # 3) поиск байтового смещения (0..7) один раз
-            if self._byte_shift is None:
-                need = 8 * (len(self._expected) * 3)
-                if len(self._bits_stream) < need:
+            if self._shift is None:
+                need = 8 * (len(self.exp) * 3)
+                if len(self._bits) < need:
                     continue
                 best_shift, best_score = 0, -1
-                exp = list(self._expected)
+                exp = list(self.exp)
                 for s in range(8):
-                    bytes_seq = [bits_to_byte(self._bits_stream[i:i+8])
-                                 for i in range(s, len(self._bits_stream)-7, 8)]
+                    bytes_seq = [bits_to_byte(self._bits[i:i+8])
+                                 for i in range(s, len(self._bits)-7, 8)]
                     score = sum(1 for i in range(len(bytes_seq)-len(exp)+1)
                                 if bytes_seq[i:i+len(exp)] == exp)
                     if score > best_score:
                         best_score, best_shift = score, s
-                self._byte_shift = best_shift
-                drop = (len(self._bits_stream) - self._byte_shift) % 8
+                self._shift = best_shift
+                drop = (len(self._bits) - self._shift) % 8
                 if drop:
-                    self._bits_stream = self._bits_stream[:-drop]
+                    self._bits = self._bits[:-drop]
                 continue
 
-            # 4) печать ASCII, начиная с найденной границы байта
-            while len(self._bits_stream) - self._byte_shift >= 8:
-                i = self._byte_shift
-                sys.stdout.write(chr(bits_to_byte(self._bits_stream[i:i+8])))
+            while len(self._bits) - self._shift >= 8:
+                i = self._shift
+                ch = chr(bits_to_byte(self._bits[i:i+8]))
+                sys.stdout.write(ch)
                 sys.stdout.flush()
-                self._byte_shift += 8
+                self._shift += 8
 
-            if self._byte_shift and self._byte_shift > 256:
-                self._bits_stream = self._bits_stream[self._byte_shift:]
-                self._byte_shift = 0
+            if self._shift and self._shift > 256:
+                self._bits = self._bits[self._shift:]
+                self._shift = 0
 
-
-# ---------- Обработчик ввода (ESC для переключения) ----------
-class InputHandler(threading.Thread):
-    def __init__(self, rx: Receiver):
-        super().__init__(name="INPUT", daemon=True)
-        self.rx = rx
-        try:
-            import msvcrt  # Windows
-            self._msvcrt = msvcrt
-        except Exception:
-            self._msvcrt = None
-
-    def run(self):
-        if self._msvcrt:
-            m = self._msvcrt
-            while True:
-                if m.kbhit():
-                    ch = m.getch()
-                    if ch == b'\x1b':  # ESC
-                        self.rx.pause()
-                        # ждём букву A/B/C/D
-                        sel = None
-                        while sel not in (b'A', b'B', b'C', b'D', b'a', b'b', b'c', b'd'):
-                            sel = m.getch()
-                        station = sel.decode('ascii').upper()
-                        self.rx.set_station(station)
-                        self.rx.resume()
-                time.sleep(0.01)
-        else:
-            # Кроссплатформенно: ввести A/B/C/D + Enter
-            while True:
-                line = sys.stdin.readline().strip().upper()
-                if line in ("A", "B", "C", "D"):
-                    self.rx.pause()
-                    self.rx.set_station(line)
-                    self.rx.resume()
-
-# ---------- Точка входа ----------
+# --- main ---
 def main():
-    # Коды Уолша 8x8
     W = walsh_codes(8)
-    codes = {
-        'A': W[0],
-        'B': W[1],
-        'C': W[2],
-        'D': W[3],
-    }
+    codes = {'A': W[0], 'B': W[1], 'C': W[2], 'D': W[3]}
+    words: Dict[str, str] = {'A': "GOD", 'B': "CAT", 'C': "HAM", 'D': "SUN"}
 
-    words: Dict[str, str] = {
-        'A': "GOD",
-        'B': "CAT",
-        'C': "HAM",
-        'D': "SUN",
-    }
+    print("Режим: 0 — канал; 1 — A; 2 — B; 3 — C; 4 — D")
+    mode = input("Введите: ").strip()
 
-    channel = Channel(num_stations=4)
+    ch = Channel(n=4)
 
-    # Приёмник сразу запускаем и печатаем только ASCII выбранной станции
-    rx = Receiver(channel=channel, codes=codes, words=words, station='D')
-    rx.start()
+    if mode == '0':
+        tap = BitTap(ch=ch, group=64)
+        tap.start()
+    else:
+        sel = {'1': 'A', '2': 'B', '3': 'C', '4': 'D'}
+        st = sel.get(mode, 'A')
+        rx = Receiver(ch=ch, codes=codes, words=words, st=st)
+        rx.start()
 
-    # Передатчики
-    txs: List[Transmitter] = []
+    txs = []
     for idx, name in enumerate(['A', 'B', 'C', 'D']):
-        txs.append(Transmitter(name=name, message=words[name], code=codes[name], station_idx=idx, channel=channel))
+        txs.append(Transmitter(name=name, msg=words[name], code=codes[name], idx=idx, ch=ch))
     for tx in txs:
         tx.start()
-
-    # ESC для переключения станции
-    ih = InputHandler(rx)
-    ih.start()
 
     try:
         while True:
