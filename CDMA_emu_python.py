@@ -108,7 +108,7 @@ class Receiver(threading.Thread):
                     sys.stdout.flush()
                     bits_buffer.clear()
                 continue
-            bit = 1 if sum(chips[i]*self.code[i] for i in range(L)) >= 0 else 0
+            bit = 1 if sum(chips[i]*self.code[i] for i in range(L)) > 0 else 0
             bits_buffer.append(bit)
 
 def main():
