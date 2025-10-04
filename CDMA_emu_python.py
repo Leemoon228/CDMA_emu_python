@@ -4,7 +4,6 @@ import sys
 from collections import deque
 from typing import List, Dict
 
-# --- Уолш-коды ---
 def hadamard(n: int) -> List[List[int]]:
     H = [[1]]
     while len(H) < n:
@@ -14,7 +13,6 @@ def hadamard(n: int) -> List[List[int]]:
 def walsh_codes(L: int) -> List[List[int]]:
     return hadamard(L)
 
-# --- Биты ---
 def bits_from_ascii(text: str) -> List[int]:
     bits: List[int] = []
     for b in text.encode('ascii'):
@@ -30,7 +28,6 @@ def bits_to_byte(bits: List[int]) -> int:
         v = (v << 1) | (b & 1)
     return v
 
-# --- Вещатель ---
 class Station:
     def __init__(self, name: str, msg: str, code: List[int]):
         self.bits = bits_from_ascii(msg)
@@ -42,7 +39,6 @@ class Station:
         self.i = (self.i + 1) % len(self.bits)
         return [bpol * c for c in self.code]
 
-# --- Канал ---
 class Channel:
     def __init__(self):
         self.q = queue.SimpleQueue()
@@ -53,7 +49,6 @@ class Channel:
     def attach(self, q: queue.SimpleQueue):
         self.q = q
 
-# --- Централизованный передатчик ---
 class Transmitter(threading.Thread):
     def __init__(self, stations: List[Station], ch: Channel):
         super().__init__(daemon=True)
@@ -62,7 +57,7 @@ class Transmitter(threading.Thread):
 
     def run(self):
         L = len(self.stations[0].code)
-        bit_count = 0  # считает, сколько бит было передано
+        bit_count = 0 
         while True:
             chips = [0] * L
             for st in self.stations:
@@ -72,12 +67,10 @@ class Transmitter(threading.Thread):
             for val in chips:
                 self.ch.put(val)
             bit_count += 1
-            # каждые 8 бит добавляем блок из 8 нулей
             if bit_count % 8 == 0:
                 for _ in range(L):
                     self.ch.put(0)
 
-# --- Печать канала ---
 class BitTap(threading.Thread):
     def __init__(self, ch: Channel):
         super().__init__(daemon=True)
@@ -86,14 +79,13 @@ class BitTap(threading.Thread):
 
     def run(self):
         self.ch.attach(self.q)
-        for _ in range(24):
+        for _ in range(30):
             row = []
             for _ in range(8):
                 val = self.q.get()
                 row.append(f"{val:+d}")
             print(" ".join(row))
 
-# --- Приёмник ---
 class Receiver(threading.Thread):
     def __init__(self, ch: Channel, code: List[int]):
         super().__init__(daemon=True)
@@ -108,9 +100,7 @@ class Receiver(threading.Thread):
         L = len(self.code)
         bits_buffer: List[int] = []
         while True:
-            # получаем L чипов
             chips = [self.q.get() for _ in range(L)]
-            # если блок нулей — конец байта
             if all(c == 0 for c in chips):
                 if bits_buffer:
                     byte_val = bits_to_byte(bits_buffer)
@@ -118,11 +108,9 @@ class Receiver(threading.Thread):
                     sys.stdout.flush()
                     bits_buffer.clear()
                 continue
-            # обычная CDMA-декодировка
             bit = 1 if sum(chips[i]*self.code[i] for i in range(L)) >= 0 else 0
             bits_buffer.append(bit)
 
-# --- main ---
 def main():
     W = walsh_codes(8)
     codes = {'A': W[0], 'B': W[1], 'C': W[2], 'D': W[3]}
